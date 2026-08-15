@@ -4,9 +4,12 @@ import android.Manifest
 import android.content.pm.PackageManager
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Preview
+import androidx.camera.core.resolutionselector.ResolutionSelector
+import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.Canvas
@@ -37,7 +40,6 @@ import org.opencv.android.OpenCVLoader
 import org.opencv.core.Point
 import java.util.concurrent.Executors
 import kotlin.math.max
-import kotlin.math.roundToInt
 
 // Matches the source SDK's own IMAGE_ANALYSIS_SCALE_WIDTH - the detection
 // algorithm's fixed-pixel kernel sizes were tuned against frames this wide.
@@ -57,7 +59,16 @@ fun DocScanScreen(modifier: Modifier = Modifier) {
 
     val openCvReady = remember { OpenCVLoader.initLocal() }
 
-    val previewView = remember { PreviewView(context) }
+    // Explicitly set rather than relying on whatever PreviewView's actual
+    // default is - mapAnalysisPointToScreen's math assumes a specific
+    // behavior (uniform scale to COVER the view, cropping the overflow,
+    // centered) and real testing showed that assumption didn't hold even
+    // after ruling out every other explanation (Preview/Analysis stream
+    // mismatch, rotation, resolution negotiation) - pinning this explicitly
+    // removes the guesswork about what's actually being rendered.
+    val previewView = remember {
+        PreviewView(context).apply { scaleType = PreviewView.ScaleType.FILL_CENTER }
+    }
     val nativeBridge = remember { OpenCvNativeBridge() }
     val cornerStabilizer = remember { CornerStabilizer() }
     // The analyzer below runs a genuinely expensive OpenCV pipeline (Canny,
@@ -107,6 +118,13 @@ fun DocScanScreen(modifier: Modifier = Modifier) {
     // original algorithm at all.
     var centerPriorityEnabled by remember { mutableStateOf(false) }
 
+    // The Camera instance returned by bindToLifecycle - only available once
+    // binding actually completes (async, inside the listener below), so the
+    // torch toggle button has to read whatever's here at click time rather
+    // than assuming it's ready immediately.
+    var boundCamera by remember { mutableStateOf<Camera?>(null) }
+    var flashEnabled by remember { mutableStateOf(false) }
+
     var hasPermission by remember {
         mutableStateOf(
             ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
@@ -130,36 +148,68 @@ fun DocScanScreen(modifier: Modifier = Modifier) {
 
         DisposableEffect(lifecycleOwner) {
             val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
-            // Wait for previewView to actually be laid out (like the source SDK's
-            // viewFinder.post { ... }) - we need its real aspect ratio below, and
-            // width/height read 0 before the first layout pass.
+            // Wait for previewView to actually be attached/laid out (like
+            // the source SDK's viewFinder.post { ... }) before binding -
+            // no longer needed for computing the target resolution (that's
+            // fixed now), but still worth keeping so surfaceProvider isn't
+            // handed out before the view is ready.
             previewView.post {
                 cameraProviderFuture.addListener({
                     val cameraProvider = cameraProviderFuture.get()
+
+                    // FIXED target, deliberately NOT derived from
+                    // previewView's live width/height (that dependency was
+                    // fragile - as more buttons got added over time, the
+                    // camera box's exact pixel size at bind time kept
+                    // shifting, which pushed CameraX toward different
+                    // supported resolutions run to run).
+                    //
+                    // Built via ResolutionSelector, not the deprecated
+                    // setTargetResolution - real testing showed
+                    // setTargetResolution had stopped reliably constraining
+                    // anything at all on this device/CameraX 1.6.1 (asked
+                    // for 400x300, got back a completely unrelated 1080x1080
+                    // square) - it's a weak hint CameraX was free to ignore.
+                    // ResolutionSelector + ResolutionStrategy is CameraX's
+                    // actual current API for this and gives a firm
+                    // bounding-size preference with an explicit fallback
+                    // rule instead.
+                    val analysisWidth = ANALYSIS_TARGET_WIDTH
+                    val analysisHeight = (analysisWidth * 3 / 4)
+                    val targetResolution = android.util.Size(analysisWidth, analysisHeight)
+                    val resolutionSelector = ResolutionSelector.Builder()
+                        .setResolutionStrategy(
+                            ResolutionStrategy(targetResolution, ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER)
+                        )
+                        .build()
+
                     val preview = Preview.Builder().build().also {
                         it.surfaceProvider = previewView.surfaceProvider
                     }
-
-                    val previewWidth = previewView.width.takeIf { it > 0 } ?: 1080
-                    val previewHeight = previewView.height.takeIf { it > 0 } ?: 1920
-                    val aspectRatio = previewWidth.toFloat() / previewHeight.toFloat()
-                    val analysisWidth = ANALYSIS_TARGET_WIDTH
-                    val analysisHeight = (analysisWidth / aspectRatio).roundToInt()
 
                     // STRATEGY_KEEP_ONLY_LATEST - if detection takes longer than a
                     // frame interval, drop stale frames rather than queueing them;
                     // we only ever care about the most recent one.
                     val imageAnalysis = ImageAnalysis.Builder()
                         .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                        .setTargetResolution(android.util.Size(analysisWidth, analysisHeight))
+                        .setResolutionSelector(resolutionSelector)
                         .build()
 
                     imageAnalysis.setAnalyzer(cameraExecutor) { image ->
                         try {
                             val mat = image.yuvToRgba()
                             val matSize = mat.size()
+                            // preview.resolutionInfo is what Preview ACTUALLY
+                            // negotiated - the one thing we've been guessing
+                            // about. If this doesn't match "actual mat" below,
+                            // the two streams are showing genuinely different
+                            // crops of the sensor, which would explain a
+                            // mismatch no amount of overlay-math tweaking can
+                            // fix on its own.
+                            val previewRes = preview.resolutionInfo?.resolution
                             debugFrameInfo = "requested ${analysisWidth}x${analysisHeight} | " +
                                 "actual mat ${matSize.width.toInt()}x${matSize.height.toInt()} | " +
+                                "preview res ${previewRes?.width}x${previewRes?.height} | " +
                                 "rotation ${image.imageInfo.rotationDegrees} | " +
                                 "view ${previewView.width}x${previewView.height}"
                             // Reads the toggles' LATEST values - each is a
@@ -198,9 +248,17 @@ fun DocScanScreen(modifier: Modifier = Modifier) {
                     }
 
                     cameraProvider.unbindAll()
-                    cameraProvider.bindToLifecycle(
+                    val camera = cameraProvider.bindToLifecycle(
                         lifecycleOwner, CameraSelector.DEFAULT_BACK_CAMERA, preview, imageAnalysis
                     )
+                    // Re-binding (e.g. after a config change) creates a new
+                    // Camera instance with torch reset to off - reapply
+                    // whatever the toggle's current state is rather than
+                    // silently losing it.
+                    if (camera.cameraInfo.hasFlashUnit()) {
+                        camera.cameraControl.enableTorch(flashEnabled)
+                    }
+                    boundCamera = camera
                 }, ContextCompat.getMainExecutor(context))
             }
 
@@ -226,6 +284,18 @@ fun DocScanScreen(modifier: Modifier = Modifier) {
             Text(debugFrameInfo, fontSize = 12.sp)
         }
 
+        Button(
+            onClick = {
+                val camera = boundCamera
+                if (camera != null && camera.cameraInfo.hasFlashUnit()) {
+                    flashEnabled = !flashEnabled
+                    camera.cameraControl.enableTorch(flashEnabled)
+                }
+            },
+            modifier = Modifier.padding(top = 8.dp)
+        ) {
+            Text(if (flashEnabled) "Flashlight: ON" else "Flashlight: OFF")
+        }
         Button(onClick = { stabilizerEnabled = !stabilizerEnabled }, modifier = Modifier.padding(top = 8.dp)) {
             Text(if (stabilizerEnabled) "Corner stabilizer: ON" else "Corner stabilizer: OFF")
         }
