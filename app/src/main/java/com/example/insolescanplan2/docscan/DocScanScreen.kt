@@ -13,11 +13,16 @@ import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -40,11 +45,17 @@ import org.opencv.android.OpenCVLoader
 import org.opencv.core.Point
 import java.util.concurrent.Executors
 import kotlin.math.max
+import kotlin.math.roundToInt
 
 // Matches the source SDK's own IMAGE_ANALYSIS_SCALE_WIDTH - the detection
 // algorithm's fixed-pixel kernel sizes were tuned against frames this wide.
 // Not an algorithm change - matching the original's own assumption.
 private const val ANALYSIS_TARGET_WIDTH = 400
+
+// How many color readings the Sample button collects before auto-stopping -
+// several frames rather than one, so a single noisy/motion-blurred frame
+// doesn't become the whole reference.
+private const val COLOR_SAMPLE_TARGET_COUNT = 20
 
 // Reset to a minimal baseline (see md/status-2026-08-14.md) after a long
 // chain of additions (temporal stabilization, color confirmation, several
@@ -125,6 +136,23 @@ fun DocScanScreen(modifier: Modifier = Modifier) {
     var boundCamera by remember { mutableStateOf<Camera?>(null) }
     var flashEnabled by remember { mutableStateOf(false) }
 
+    // Live color reading from whatever's currently detected, every frame -
+    // shown on screen for feedback and fed into collectedSamples below while
+    // sampling is active.
+    var sampledColor by remember { mutableStateOf<SampledColor?>(null) }
+    // True between tapping Sample and either reaching
+    // COLOR_SAMPLE_TARGET_COUNT or tapping it again to stop early.
+    var colorSamplingActive by remember { mutableStateOf(false) }
+    var collectedSamples by remember { mutableStateOf(listOf<SampledColor>()) }
+    // The averaged reference color, set by Lock - null until the user has
+    // actually locked one in, at which point matchesLockedColor (see
+    // ColorCheck.kt) starts being usable as a real guard instead of nothing
+    // to compare against.
+    var lockedColor by remember { mutableStateOf<SampledColor?>(null) }
+    // Locking auto-enables this, but it stays a separate toggle so
+    // enforcement can be paused/resumed without re-sampling.
+    var colorGuardEnabled by remember { mutableStateOf(false) }
+
     var hasPermission by remember {
         mutableStateOf(
             ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
@@ -134,7 +162,13 @@ fun DocScanScreen(modifier: Modifier = Modifier) {
         ActivityResultContracts.RequestPermission()
     ) { granted -> hasPermission = granted }
 
-    Column(modifier = modifier.padding(16.dp)) {
+    // Scrollable, and the camera Box below gets a FIXED height rather than
+    // weight(1f) - with ~10 toggle buttons plus status/debug text, the
+    // button area's natural height could exceed the screen, and weight(1f)
+    // would have shrunk the camera preview to make room rather than letting
+    // the extra content scroll - exactly the "buttons block the camera
+    // view" complaint.
+    Column(modifier = modifier.padding(16.dp).verticalScroll(rememberScrollState())) {
         if (!openCvReady) {
             Text("OpenCV failed to load")
             return@Column
@@ -225,7 +259,6 @@ fun DocScanScreen(modifier: Modifier = Modifier) {
                                 centerPriorityEnabled = centerPriorityEnabled
                             )
                             val quad = nativeBridge.detectLargestQuadrilateral(mat, guardConfig)
-                            mat.release()
 
                             val resultPoints = if (stabilizerEnabled) {
                                 cornerStabilizer.update(quad?.points, matSize.width)
@@ -237,11 +270,29 @@ fun DocScanScreen(modifier: Modifier = Modifier) {
                                 quad?.points
                             }
 
+                            // Sampled BEFORE releasing mat, from the same
+                            // resultPoints that get displayed - both the
+                            // live readout and anything collected into
+                            // collectedSamples reflect the actual detected
+                            // region, not a fluke frame that never shows.
+                            val colorHere = resultPoints?.let { meanHsvInRegion(mat, it) }
+                            mat.release()
+                            sampledColor = colorHere
+
+                            if (colorSamplingActive && colorHere != null) {
+                                val updated = collectedSamples + colorHere
+                                collectedSamples = updated
+                                if (updated.size >= COLOR_SAMPLE_TARGET_COUNT) {
+                                    colorSamplingActive = false
+                                }
+                            }
+
                             detectedCorners = resultPoints?.map { point ->
                                 mapAnalysisPointToScreen(point, matSize.width, matSize.height, previewView.width, previewView.height)
                             }
                         } catch (e: Exception) {
                             detectedCorners = null
+                            sampledColor = null
                         } finally {
                             image.close()
                         }
@@ -270,49 +321,104 @@ fun DocScanScreen(modifier: Modifier = Modifier) {
             }
         }
 
-        Box(modifier = Modifier.fillMaxWidth().weight(1f)) {
+        val colorMatches = if (colorGuardEnabled && lockedColor != null) {
+            sampledColor?.let { matchesLockedColor(it, lockedColor!!) } ?: false
+        } else {
+            true
+        }
+        val matched = colorMatches
+
+        Box(modifier = Modifier.fillMaxWidth().height(300.dp)) {
             AndroidView(factory = { previewView }, modifier = Modifier.fillMaxSize())
-            DetectionOverlay(detectedCorners, modifier = Modifier.fillMaxSize())
+            DetectionOverlay(detectedCorners, matched = matched, modifier = Modifier.fillMaxSize())
         }
 
-        Text(
-            if (detectedCorners != null) "Detected" else "Not detected",
-            fontSize = 18.sp,
-            color = if (detectedCorners != null) Color(0xFF33CC33) else Color(0xFFFF4444)
-        )
+        val (statusText, statusColor) = when {
+            detectedCorners == null -> "Not detected" to Color(0xFFFF4444)
+            !colorMatches -> "Shape found - wrong color" to Color(0xFFFFAA00)
+            else -> "Detected" to Color(0xFF33CC33)
+        }
+        Text(statusText, fontSize = 18.sp, color = statusColor)
         if (debugFrameInfo.isNotEmpty()) {
             Text(debugFrameInfo, fontSize = 12.sp)
         }
 
-        Button(
-            onClick = {
+        // Live readout - point the camera at the real object and watch this
+        // to judge whether Sample/Lock is capturing something sensible.
+        sampledColor?.let {
+            Text("Live H=${it.hue.roundToInt()} S=${it.saturation.roundToInt()} V=${it.value.roundToInt()}", fontSize = 14.sp)
+        }
+        lockedColor?.let {
+            Text(
+                "Locked H=${it.hue.roundToInt()} S=${it.saturation.roundToInt()} V=${it.value.roundToInt()}",
+                fontSize = 14.sp
+            )
+        }
+
+        // 2-per-row grid instead of one button per row - keeps the whole
+        // control area compact and predictable regardless of how many
+        // toggles exist, rather than a single tall column.
+        val toggleButtons = listOf<Pair<String, () -> Unit>>(
+            (
+                if (colorSamplingActive) {
+                    "Sampling... (${collectedSamples.size}/$COLOR_SAMPLE_TARGET_COUNT)"
+                } else {
+                    "Sample color (${collectedSamples.size})"
+                }
+                ) to {
+                if (colorSamplingActive) {
+                    colorSamplingActive = false
+                } else {
+                    collectedSamples = emptyList()
+                    colorSamplingActive = true
+                }
+            },
+            (if (lockedColor != null) "Re-lock color sample" else "Lock color sample") to {
+                if (collectedSamples.isNotEmpty()) {
+                    lockedColor = averageColor(collectedSamples)
+                    colorGuardEnabled = true
+                }
+            },
+            (if (colorGuardEnabled) "Color guard: ON" else "Color guard: OFF") to {
+                colorGuardEnabled = !colorGuardEnabled
+            },
+            (if (flashEnabled) "Flashlight: ON" else "Flashlight: OFF") to {
                 val camera = boundCamera
                 if (camera != null && camera.cameraInfo.hasFlashUnit()) {
                     flashEnabled = !flashEnabled
                     camera.cameraControl.enableTorch(flashEnabled)
                 }
             },
-            modifier = Modifier.padding(top = 8.dp)
-        ) {
-            Text(if (flashEnabled) "Flashlight: ON" else "Flashlight: OFF")
-        }
-        Button(onClick = { stabilizerEnabled = !stabilizerEnabled }, modifier = Modifier.padding(top = 8.dp)) {
-            Text(if (stabilizerEnabled) "Corner stabilizer: ON" else "Corner stabilizer: OFF")
-        }
-        Button(onClick = { edgeMarginGuardEnabled = !edgeMarginGuardEnabled }, modifier = Modifier.padding(top = 8.dp)) {
-            Text(if (edgeMarginGuardEnabled) "Edge-margin guard: ON" else "Edge-margin guard: OFF")
-        }
-        Button(onClick = { oppositeSideGuardEnabled = !oppositeSideGuardEnabled }, modifier = Modifier.padding(top = 8.dp)) {
-            Text(if (oppositeSideGuardEnabled) "Opposite-side guard: ON" else "Opposite-side guard: OFF")
-        }
-        Button(onClick = { minAreaGuardEnabled = !minAreaGuardEnabled }, modifier = Modifier.padding(top = 8.dp)) {
-            Text(if (minAreaGuardEnabled) "Min-area guard: ON" else "Min-area guard: OFF")
-        }
-        Button(onClick = { aspectRatioGuardEnabled = !aspectRatioGuardEnabled }, modifier = Modifier.padding(top = 8.dp)) {
-            Text(if (aspectRatioGuardEnabled) "Aspect-ratio guard: ON" else "Aspect-ratio guard: OFF")
-        }
-        Button(onClick = { centerPriorityEnabled = !centerPriorityEnabled }, modifier = Modifier.padding(top = 8.dp)) {
-            Text(if (centerPriorityEnabled) "Center-priority: ON" else "Center-priority: OFF")
+            (if (stabilizerEnabled) "Corner stabilizer: ON" else "Corner stabilizer: OFF") to {
+                stabilizerEnabled = !stabilizerEnabled
+            },
+            (if (edgeMarginGuardEnabled) "Edge-margin guard: ON" else "Edge-margin guard: OFF") to {
+                edgeMarginGuardEnabled = !edgeMarginGuardEnabled
+            },
+            (if (oppositeSideGuardEnabled) "Opposite-side guard: ON" else "Opposite-side guard: OFF") to {
+                oppositeSideGuardEnabled = !oppositeSideGuardEnabled
+            },
+            (if (minAreaGuardEnabled) "Min-area guard: ON" else "Min-area guard: OFF") to {
+                minAreaGuardEnabled = !minAreaGuardEnabled
+            },
+            (if (aspectRatioGuardEnabled) "Aspect-ratio guard: ON" else "Aspect-ratio guard: OFF") to {
+                aspectRatioGuardEnabled = !aspectRatioGuardEnabled
+            },
+            (if (centerPriorityEnabled) "Center-priority: ON" else "Center-priority: OFF") to {
+                centerPriorityEnabled = !centerPriorityEnabled
+            }
+        )
+        toggleButtons.chunked(2).forEach { row ->
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                row.forEach { (label, onClick) ->
+                    Button(onClick = onClick, modifier = Modifier.weight(1f)) {
+                        Text(label, fontSize = 13.sp)
+                    }
+                }
+            }
         }
     }
 }
@@ -366,18 +472,22 @@ private fun mapAnalysisPointToScreen(
 }
 
 @Composable
-private fun DetectionOverlay(corners: List<Offset>?, modifier: Modifier = Modifier) {
+private fun DetectionOverlay(corners: List<Offset>?, matched: Boolean, modifier: Modifier = Modifier) {
     Canvas(modifier = modifier) {
         if (corners == null || corners.size != 4) return@Canvas
 
+        // Green once the color check also confirms it (or the color guard
+        // is off/not yet locked), amber if a shape was found but the locked
+        // color check rejected it.
+        val outlineColor = if (matched) Color(0xFF33CC33) else Color(0xFFFFAA00)
         val strokeWidth = 4.dp.toPx()
         for (i in corners.indices) {
             val start = corners[i]
             val end = corners[(i + 1) % corners.size]
-            drawLine(color = Color(0xFF33CC33), start = start, end = end, strokeWidth = strokeWidth)
+            drawLine(color = outlineColor, start = start, end = end, strokeWidth = strokeWidth)
         }
         for (corner in corners) {
-            drawCircle(color = Color(0xFF33CC33), radius = 10.dp.toPx(), center = corner, style = Stroke(width = strokeWidth))
+            drawCircle(color = outlineColor, radius = 10.dp.toPx(), center = corner, style = Stroke(width = strokeWidth))
         }
     }
 }
