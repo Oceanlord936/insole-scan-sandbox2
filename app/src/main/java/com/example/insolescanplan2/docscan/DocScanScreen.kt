@@ -36,6 +36,7 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import org.opencv.android.OpenCVLoader
 import org.opencv.core.Point
 import java.util.concurrent.Executors
+import kotlin.math.max
 import kotlin.math.roundToInt
 
 // Matches the source SDK's own IMAGE_ANALYSIS_SCALE_WIDTH - the detection
@@ -58,16 +59,40 @@ fun DocScanScreen(modifier: Modifier = Modifier) {
 
     val previewView = remember { PreviewView(context) }
     val nativeBridge = remember { OpenCvNativeBridge() }
+    val cornerStabilizer = remember { CornerStabilizer() }
     // The analyzer below runs a genuinely expensive OpenCV pipeline (Canny,
     // morphology, contour-finding) every frame - kept off the main/UI thread
     // so it never competes with normal recomposition work there. Not part of
     // the original algorithm either way - purely where it executes.
     val cameraExecutor = remember { Executors.newSingleThreadExecutor() }
 
-    // Screen-space corners of this frame's raw detection, already mapped
+    // Screen-space corners of the CURRENT displayed result, already mapped
     // into the overlay Canvas's own pixel coordinates - null means nothing
-    // was detected this frame. No smoothing/memory across frames.
+    // to show this frame. Raw per-frame detection when the stabilizer is
+    // off, the stabilizer's smoothed result when it's on.
     var detectedCorners by remember { mutableStateOf<List<Offset>?>(null) }
+    // Debug readout: what resolution we asked CameraX for vs what the
+    // analysis Mat actually comes in as, plus the live preview view's own
+    // pixel size - mapAnalysisPointToScreen assumes a fixed 90-degree
+    // rotation between these, and if the ACTUAL analysis frame doesn't have
+    // the dimensions that assumption expects, the overlay would be
+    // systematically distorted on one axis (reported symptom: top/bottom of
+    // a real rectangle not covered by the green outline) even with every
+    // detection guard off, since guards only accept/reject candidates, they
+    // never touch where points get drawn.
+    var debugFrameInfo by remember { mutableStateOf("") }
+    // Smooths the jittery raw per-frame detection into a steady result -
+    // defaults ON, unlike the shape guards below, since it doesn't change
+    // WHAT gets accepted as a detection, only how steady it looks once
+    // accepted. Suspected but NOT confirmed as the source of the
+    // "always-long-object" symptom - if a spuriously long environmental
+    // artifact (a floorboard seam, a shadow) is being detected raw and
+    // consistently, the stabilizer would faithfully lock onto and display
+    // it just as confidently as a real object, which could make a
+    // pre-existing raw-detection issue look worse/stickier than it already
+    // was, rather than being the root cause itself. Worth comparing
+    // behavior with this off vs on against the same real test conditions.
+    var stabilizerEnabled by remember { mutableStateOf(true) }
 
     // The geometric guards inside OpenCvNativeBridge, reapplied one at a
     // time - all default OFF (universal any-4-edge scan is the baseline),
@@ -133,6 +158,10 @@ fun DocScanScreen(modifier: Modifier = Modifier) {
                         try {
                             val mat = image.yuvToRgba()
                             val matSize = mat.size()
+                            debugFrameInfo = "requested ${analysisWidth}x${analysisHeight} | " +
+                                "actual mat ${matSize.width.toInt()}x${matSize.height.toInt()} | " +
+                                "rotation ${image.imageInfo.rotationDegrees} | " +
+                                "view ${previewView.width}x${previewView.height}"
                             // Reads the toggles' LATEST values - each is a
                             // delegated property over a remembered State, so
                             // referencing it re-reads the current value at
@@ -148,7 +177,17 @@ fun DocScanScreen(modifier: Modifier = Modifier) {
                             val quad = nativeBridge.detectLargestQuadrilateral(mat, guardConfig)
                             mat.release()
 
-                            detectedCorners = quad?.points?.map { point ->
+                            val resultPoints = if (stabilizerEnabled) {
+                                cornerStabilizer.update(quad?.points, matSize.width)
+                            } else {
+                                // Not just skipped - actively cleared, so
+                                // toggling back on doesn't instantly average
+                                // in stale samples from before it was off.
+                                cornerStabilizer.reset()
+                                quad?.points
+                            }
+
+                            detectedCorners = resultPoints?.map { point ->
                                 mapAnalysisPointToScreen(point, matSize.width, matSize.height, previewView.width, previewView.height)
                             }
                         } catch (e: Exception) {
@@ -183,7 +222,13 @@ fun DocScanScreen(modifier: Modifier = Modifier) {
             fontSize = 18.sp,
             color = if (detectedCorners != null) Color(0xFF33CC33) else Color(0xFFFF4444)
         )
+        if (debugFrameInfo.isNotEmpty()) {
+            Text(debugFrameInfo, fontSize = 12.sp)
+        }
 
+        Button(onClick = { stabilizerEnabled = !stabilizerEnabled }, modifier = Modifier.padding(top = 8.dp)) {
+            Text(if (stabilizerEnabled) "Corner stabilizer: ON" else "Corner stabilizer: OFF")
+        }
         Button(onClick = { edgeMarginGuardEnabled = !edgeMarginGuardEnabled }, modifier = Modifier.padding(top = 8.dp)) {
             Text(if (edgeMarginGuardEnabled) "Edge-margin guard: ON" else "Edge-margin guard: OFF")
         }
@@ -208,6 +253,19 @@ fun DocScanScreen(modifier: Modifier = Modifier) {
 // pixel space) into the portrait view's own pixel coordinates. Same fixed
 // 90-degree-rotation assumption as the source SDK's ScanCanvasView.showShape,
 // which only targets portrait use - fine for our case, not a general solution.
+//
+// Real measured numbers (analysis Mat 640x480, PreviewView 996x960) showed
+// the previous version was wrong beyond just the rotation: it stretched the
+// content independently on X and Y to exactly fill the view, but
+// PreviewView's actual default ScaleType is FILL_CENTER - a single UNIFORM
+// scale that covers the view and crops whatever overflows, centered. Those
+// are genuinely different transforms whenever the content and view aspect
+// ratios don't match (here: content 480x640 after rotation vs. a nearly
+// square 996x960 view) - the mismatch was exactly why the green outline
+// didn't reach the real top/bottom edges of a detected rectangle: the
+// overlay was mapped as if the full sensor image were visible uncropped,
+// when PreviewView was actually cropping its top and bottom to fill the
+// wider container.
 private fun mapAnalysisPointToScreen(
     point: Point,
     matWidth: Double,
@@ -216,13 +274,24 @@ private fun mapAnalysisPointToScreen(
     viewHeightPx: Int
 ): Offset {
     if (viewWidthPx == 0 || viewHeightPx == 0) return Offset.Zero
-    val logicalWidth = matHeight.toFloat()
-    val logicalHeight = matWidth.toFloat()
-    val logicalX = logicalWidth - point.y.toFloat()
+    // Content dimensions after the fixed 90-degree rotation, before any
+    // view-fitting scale/crop.
+    val contentWidth = matHeight.toFloat()
+    val contentHeight = matWidth.toFloat()
+    val logicalX = contentWidth - point.y.toFloat()
     val logicalY = point.x.toFloat()
+
+    // FILL_CENTER: one scale factor for both axes (the larger of the two
+    // "fill this dimension" ratios, so the content covers the view
+    // completely), then centered - matching PreviewView's own rendering
+    // instead of an independent-axis stretch.
+    val scale = max(viewWidthPx / contentWidth, viewHeightPx / contentHeight)
+    val offsetX = (viewWidthPx - contentWidth * scale) / 2f
+    val offsetY = (viewHeightPx - contentHeight * scale) / 2f
+
     return Offset(
-        logicalX * (viewWidthPx / logicalWidth),
-        logicalY * (viewHeightPx / logicalHeight)
+        offsetX + logicalX * scale,
+        offsetY + logicalY * scale
     )
 }
 
