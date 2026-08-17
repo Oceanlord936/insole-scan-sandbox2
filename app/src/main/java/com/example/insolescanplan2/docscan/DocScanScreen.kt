@@ -2,12 +2,21 @@ package com.example.insolescanplan2.docscan
 
 import android.Manifest
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Matrix
+import android.graphics.Rect
+import android.util.Log
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
+import androidx.camera.core.ImageCapture
+import androidx.camera.core.ImageCaptureException
+import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
+import androidx.camera.core.resolutionselector.AspectRatioStrategy
 import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
@@ -21,6 +30,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.background
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
@@ -31,11 +41,14 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -44,6 +57,7 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import org.opencv.android.OpenCVLoader
 import org.opencv.core.Point
 import java.util.concurrent.Executors
+import kotlin.math.ceil
 import kotlin.math.max
 import kotlin.math.roundToInt
 
@@ -56,6 +70,27 @@ private const val ANALYSIS_TARGET_WIDTH = 400
 // several frames rather than one, so a single noisy/motion-blurred frame
 // doesn't become the whole reference.
 private const val COLOR_SAMPLE_TARGET_COUNT = 20
+
+// Minimum time between auto-captures during a scan session - a guard
+// against the same held pose re-triggering a second capture if the
+// orientation signature jitters across a bucket boundary right after a
+// capture, not a meaningful UX pacing choice.
+private const val CAPTURE_COOLDOWN_MS = 1500L
+
+// How long a genuinely new angle has to be held before it's actually
+// captured - the corner stabilizer already means the QUAD is holding still,
+// but the user's hand is very likely still in frame right when they stop
+// turning the foam. This delay, with a big on-screen countdown, is the
+// user's cue to pull their hand out of the way before the shutter fires.
+private const val HOLD_STILL_MS = 2000L
+
+// Padding added around the detected quad's bounding box before cropping a
+// captured photo, as a fraction of that box's own width/height - keeps
+// detection jitter from clipping a real edge of the foam out of the saved
+// crop.
+private const val CROP_MARGIN_RATIO = 0.1
+
+private const val CAPTURE_LOG_TAG = "InsoleCapture"
 
 // Reset to a minimal baseline (see md/status-2026-08-14.md) after a long
 // chain of additions (temporal stabilization, color confirmation, several
@@ -153,6 +188,35 @@ fun DocScanScreen(modifier: Modifier = Modifier) {
     // enforcement can be paused/resumed without re-sampling.
     var colorGuardEnabled by remember { mutableStateOf(false) }
 
+    // Guided multi-angle capture session - see md/plan for the full design.
+    // While active, the tuning/guard UI is replaced with progress + prompt
+    // text and a Stop button, and the corner stabilizer is forced on
+    // (auto-capture needs its "held roughly still" debounce regardless of
+    // the tuning toggle's own state).
+    var sessionActive by remember { mutableStateOf(false) }
+    val captureCoverage = remember { CaptureCoverage() }
+    // Which cell the most recent successful capture landed in - a cell
+    // already holding one capture only gets a second (the presumed
+    // 180-degree twin) if this does NOT match its own cell, i.e. the two
+    // captures of the same cell can't be consecutive.
+    var lastCapturedCell by remember { mutableStateOf<Triple<Int, Int, Int>?>(null) }
+    var coverageCount by remember { mutableStateOf(0) }
+    var sessionPrompt by remember { mutableStateOf("") }
+    // Internal bookkeeping for the analyzer callback (single-threaded via
+    // cameraExecutor, so plain state without extra synchronization is safe)
+    // - not read anywhere the UI needs it directly.
+    var isCapturing by remember { mutableStateOf(false) }
+    var lastCaptureTimeMs by remember { mutableStateOf(0L) }
+    var captureSession by remember { mutableStateOf<CaptureSession?>(null) }
+    // Which not-yet-covered cell is currently being held, and since when -
+    // reset any time tracking is lost or the pose jumps to a different new
+    // cell, so the hold has to be continuous. holdStillCountdown is the
+    // UI-facing seconds-remaining derived from these each frame (null =
+    // nothing counting down right now).
+    var pendingCell by remember { mutableStateOf<Triple<Int, Int, Int>?>(null) }
+    var pendingSince by remember { mutableStateOf(0L) }
+    var holdStillCountdown by remember { mutableStateOf<Int?>(null) }
+
     var hasPermission by remember {
         mutableStateOf(
             ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
@@ -229,6 +293,23 @@ fun DocScanScreen(modifier: Modifier = Modifier) {
                         .setResolutionSelector(resolutionSelector)
                         .build()
 
+                    // Bound once here alongside Preview/ImageAnalysis, never
+                    // rebound later when a capture session starts/stops -
+                    // rebinding use cases was exactly what made resolution
+                    // negotiation flaky before (see md/status-2026-08-14-part2.md,
+                    // Mistake 3). Only the aspect ratio is pinned (matching
+                    // ImageAnalysis's forced 4:3) so the capture stream's crop
+                    // matches the analysis stream's - resolution itself is left
+                    // unconstrained so CameraX picks the sensor's largest
+                    // still-capture size.
+                    val imageCapture = ImageCapture.Builder()
+                        .setResolutionSelector(
+                            ResolutionSelector.Builder()
+                                .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
+                                .build()
+                        )
+                        .build()
+
                     imageAnalysis.setAnalyzer(cameraExecutor) { image ->
                         try {
                             val mat = image.yuvToRgba()
@@ -290,6 +371,120 @@ fun DocScanScreen(modifier: Modifier = Modifier) {
                             detectedCorners = resultPoints?.map { point ->
                                 mapAnalysisPointToScreen(point, matSize.width, matSize.height, previewView.width, previewView.height)
                             }
+
+                            // Guided capture: only fires while a session is
+                            // active, on the same stabilizer-backed
+                            // resultPoints used for display (several
+                            // consecutive close frames, i.e. the user has
+                            // actually stopped moving - forced via
+                            // stabilizerEnabled=true when a session starts).
+                            // Finding a new-cell pose doesn't capture
+                            // immediately - it starts a HOLD_STILL_MS
+                            // countdown (reset if the pose jumps to a
+                            // different new cell, or tracking is lost) so
+                            // the user's hand has time to move out of frame
+                            // before the shutter actually fires.
+                            val session = captureSession
+                            if (resultPoints == null) {
+                                pendingCell = null
+                                holdStillCountdown = null
+                            } else {
+                                val signature = computeOrientation(resultPoints)
+                                val cell = captureCoverage.cellFor(signature)
+                                if (!sessionActive) {
+                                    pendingCell = null
+                                    holdStillCountdown = null
+                                } else if (
+                                    session != null && !captureCoverage.isComplete && !isCapturing &&
+                                    System.currentTimeMillis() - lastCaptureTimeMs >= CAPTURE_COOLDOWN_MS
+                                ) {
+                                    val colorOk = if (colorGuardEnabled && lockedColor != null) {
+                                        colorHere != null && matchesLockedColor(colorHere, lockedColor!!)
+                                    } else {
+                                        true
+                                    }
+                                    // A cell already has one capture - the
+                                    // second (presumed 180-degree twin) is
+                                    // only allowed if the immediately
+                                    // preceding capture was of a DIFFERENT
+                                    // cell, i.e. the two can't be consecutive.
+                                    val blockedAsRepeat = captureCoverage.fillCountFor(signature) > 0 && lastCapturedCell == cell
+                                    if (!colorOk) {
+                                        pendingCell = null
+                                        holdStillCountdown = null
+                                    } else if (!captureCoverage.canCapture(signature) || blockedAsRepeat) {
+                                        pendingCell = null
+                                        holdStillCountdown = null
+                                        sessionPrompt = "Already have this angle (${captureCoverage.filledCount}/20) - turn or tilt a bit more"
+                                    } else {
+                                        val now = System.currentTimeMillis()
+                                        if (pendingCell != cell) {
+                                            pendingCell = cell
+                                            pendingSince = now
+                                        }
+                                        val elapsed = now - pendingSince
+                                        if (elapsed < HOLD_STILL_MS) {
+                                            holdStillCountdown = ceil((HOLD_STILL_MS - elapsed) / 1000.0).toInt()
+                                            sessionPrompt = "New angle found - hold still"
+                                        } else {
+                                            pendingCell = null
+                                            holdStillCountdown = null
+                                            captureCoverage.reserve(signature)
+                                            // Restored on failure below, so a
+                                            // retry isn't wrongly blocked as
+                                            // "consecutive" against a capture
+                                            // that never actually happened.
+                                            val previousLastCapturedCell = lastCapturedCell
+                                            lastCapturedCell = cell
+                                            isCapturing = true
+                                            sessionPrompt = "Capturing..."
+                                            val capturedMatWidth = matSize.width
+                                            val capturedMatHeight = matSize.height
+                                            val capturedPoints = resultPoints
+                                            imageCapture.takePicture(
+                                                cameraExecutor,
+                                                object : ImageCapture.OnImageCapturedCallback() {
+                                                    override fun onCaptureSuccess(image: ImageProxy) {
+                                                        try {
+                                                            saveCapturedFrame(
+                                                                image,
+                                                                capturedPoints,
+                                                                capturedMatWidth,
+                                                                capturedMatHeight,
+                                                                signature,
+                                                                session
+                                                            )
+                                                            coverageCount = captureCoverage.filledCount
+                                                            sessionPrompt = if (captureCoverage.isComplete) {
+                                                                "Coverage complete! Tap Stop to finish."
+                                                            } else {
+                                                                "Captured $coverageCount/20 - keep turning/tilting"
+                                                            }
+                                                        } catch (e: Exception) {
+                                                            captureCoverage.release(signature)
+                                                            lastCapturedCell = previousLastCapturedCell
+                                                            sessionPrompt = "Capture failed, try again"
+                                                            Log.e(CAPTURE_LOG_TAG, "Failed to save capture", e)
+                                                        } finally {
+                                                            image.close()
+                                                            isCapturing = false
+                                                            lastCaptureTimeMs = System.currentTimeMillis()
+                                                        }
+                                                    }
+
+                                                    override fun onError(exception: ImageCaptureException) {
+                                                        captureCoverage.release(signature)
+                                                        lastCapturedCell = previousLastCapturedCell
+                                                        isCapturing = false
+                                                        sessionPrompt = "Capture failed, try again"
+                                                        Log.e(CAPTURE_LOG_TAG, "takePicture failed", exception)
+                                                    }
+                                                }
+                                            )
+                                        }
+                                    }
+                                }
+                            }
                         } catch (e: Exception) {
                             detectedCorners = null
                             sampledColor = null
@@ -300,7 +495,7 @@ fun DocScanScreen(modifier: Modifier = Modifier) {
 
                     cameraProvider.unbindAll()
                     val camera = cameraProvider.bindToLifecycle(
-                        lifecycleOwner, CameraSelector.DEFAULT_BACK_CAMERA, preview, imageAnalysis
+                        lifecycleOwner, CameraSelector.DEFAULT_BACK_CAMERA, preview, imageAnalysis, imageCapture
                     )
                     // Re-binding (e.g. after a config change) creates a new
                     // Camera instance with torch reset to off - reapply
@@ -331,6 +526,23 @@ fun DocScanScreen(modifier: Modifier = Modifier) {
         Box(modifier = Modifier.fillMaxWidth().height(300.dp)) {
             AndroidView(factory = { previewView }, modifier = Modifier.fillMaxSize())
             DetectionOverlay(detectedCorners, matched = matched, modifier = Modifier.fillMaxSize())
+            // Large, high-contrast countdown drawn directly over the live
+            // feed - the point is to be impossible to miss while the user's
+            // hand is still near the foam, unlike the small status text
+            // below the preview.
+            holdStillCountdown?.let { seconds ->
+                Text(
+                    "HOLD STILL\n$seconds",
+                    fontSize = 40.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = Color.White,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier
+                        .align(Alignment.Center)
+                        .background(Color(0xAA000000))
+                        .padding(24.dp)
+                )
+            }
         }
 
         val (statusText, statusColor) = when {
@@ -355,10 +567,50 @@ fun DocScanScreen(modifier: Modifier = Modifier) {
             )
         }
 
+        if (sessionActive) {
+            // Replaces the tuning/guard controls entirely while a session
+            // runs - progress + the current guidance prompt, plus Stop,
+            // which works at any point regardless of how many angles have
+            // been captured so far.
+            Text("Captured $coverageCount/20 unique angles", fontSize = 16.sp)
+            if (sessionPrompt.isNotEmpty()) {
+                Text(sessionPrompt, fontSize = 14.sp)
+            }
+            Button(
+                onClick = {
+                    sessionActive = false
+                    lastCapturedCell = null
+                    pendingCell = null
+                    holdStillCountdown = null
+                },
+                modifier = Modifier.fillMaxWidth().padding(top = 8.dp)
+            ) {
+                Text("Stop scan")
+            }
+        } else {
+            Button(
+                onClick = {
+                    captureCoverage.reset()
+                    coverageCount = 0
+                    stabilizerEnabled = true
+                    captureSession = CaptureSession(context)
+                    sessionPrompt = "Show the foam to begin"
+                    lastCapturedCell = null
+                    pendingCell = null
+                    holdStillCountdown = null
+                    sessionActive = true
+                },
+                modifier = Modifier.fillMaxWidth().padding(top = 8.dp)
+            ) {
+                Text("Start scan (20 angles)")
+            }
+        }
+
         // 2-per-row grid instead of one button per row - keeps the whole
         // control area compact and predictable regardless of how many
-        // toggles exist, rather than a single tall column.
-        val toggleButtons = listOf<Pair<String, () -> Unit>>(
+        // toggles exist, rather than a single tall column. Hidden during a
+        // capture session so it doesn't compete with the guided-scan UI.
+        val toggleButtons = if (sessionActive) emptyList() else listOf<Pair<String, () -> Unit>>(
             (
                 if (colorSamplingActive) {
                     "Sampling... (${collectedSamples.size}/$COLOR_SAMPLE_TARGET_COUNT)"
@@ -468,6 +720,81 @@ private fun mapAnalysisPointToScreen(
     return Offset(
         offsetX + logicalX * scale,
         offsetY + logicalY * scale
+    )
+}
+
+// Crops a full-resolution ImageCapture still down to the detected quad and
+// saves it - deliberately a plain crop, not a perspective warp, since the
+// perspective distortion is exactly the signal a backend photogrammetry/3D
+// step needs from each of the ~20 angles; warping it away would erase what
+// makes the shots different viewpoints.
+//
+// image's JPEG bytes come in the sensor's native (un-rotated) orientation -
+// the same convention resultPoints/matWidth/matHeight already use - so the
+// quad corners are mapped into that native pixel space with a pure scale,
+// no rotation. Only the final small crop gets rotated (by
+// imageInfo.rotationDegrees) into an upright, human-viewable orientation,
+// since rotating the multi-megapixel original first would be needless work.
+// This orientation assumption is exactly the kind that has broken this
+// project before (see md/status-2026-08-14-part2.md) - logged here so it's
+// verifiable against a real device rather than trusted blindly.
+private fun saveCapturedFrame(
+    image: ImageProxy,
+    matPoints: Array<Point>,
+    matWidth: Double,
+    matHeight: Double,
+    signature: OrientationSignature,
+    session: CaptureSession
+) {
+    val buffer = image.planes[0].buffer
+    val bytes = ByteArray(buffer.remaining())
+    buffer.get(bytes)
+    val nativeBitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+        ?: throw IllegalStateException("Failed to decode captured JPEG")
+
+    val rotationDegrees = image.imageInfo.rotationDegrees
+
+    Log.d(
+        CAPTURE_LOG_TAG,
+        "native ${nativeBitmap.width}x${nativeBitmap.height} | mat ${matWidth.toInt()}x${matHeight.toInt()} | " +
+            "rotation $rotationDegrees"
+    )
+
+    val scaleX = nativeBitmap.width / matWidth
+    val scaleY = nativeBitmap.height / matHeight
+    val xs = matPoints.map { it.x * scaleX }
+    val ys = matPoints.map { it.y * scaleY }
+    val minX = xs.min()
+    val maxX = xs.max()
+    val minY = ys.min()
+    val maxY = ys.max()
+    val marginX = (maxX - minX) * CROP_MARGIN_RATIO
+    val marginY = (maxY - minY) * CROP_MARGIN_RATIO
+
+    val left = (minX - marginX).toInt().coerceIn(0, nativeBitmap.width - 1)
+    val top = (minY - marginY).toInt().coerceIn(0, nativeBitmap.height - 1)
+    val right = (maxX + marginX).toInt().coerceIn(left + 1, nativeBitmap.width)
+    val bottom = (maxY + marginY).toInt().coerceIn(top + 1, nativeBitmap.height)
+    val cropRect = Rect(left, top, right, bottom)
+
+    val cropped = Bitmap.createBitmap(nativeBitmap, left, top, right - left, bottom - top)
+    val finalBitmap = if (rotationDegrees != 0) {
+        val matrix = Matrix().apply { postRotate(rotationDegrees.toFloat()) }
+        Bitmap.createBitmap(cropped, 0, 0, cropped.width, cropped.height, matrix, true)
+    } else {
+        cropped
+    }
+
+    val nativeCorners = matPoints.mapIndexed { i, _ -> Point(xs[i], ys[i]) }.toTypedArray()
+
+    session.saveCapture(
+        finalBitmap = finalBitmap,
+        signature = signature,
+        nativeImageWidth = nativeBitmap.width,
+        nativeImageHeight = nativeBitmap.height,
+        cropRectNative = cropRect,
+        cornersNative = nativeCorners,
+        rotationDegreesApplied = rotationDegrees
     )
 }
 
