@@ -723,21 +723,26 @@ private fun mapAnalysisPointToScreen(
     )
 }
 
-// Crops a full-resolution ImageCapture still down to the detected quad and
-// saves it - deliberately a plain crop, not a perspective warp, since the
-// perspective distortion is exactly the signal a backend photogrammetry/3D
-// step needs from each of the ~20 angles; warping it away would erase what
-// makes the shots different viewpoints.
+// Saves TWO files per capture (see CaptureStorage.kt's class doc for why):
+// the raw captured JPEG bytes untouched (preserves EXIF - the intended
+// photogrammetry input), and a crop of it down to the detected quad
+// (a convenience copy only, not meant to feed reconstruction). The crop is
+// deliberately a plain crop, not a perspective warp - the perspective
+// distortion is exactly the signal a backend photogrammetry/3D step needs
+// from each of the ~20 angles; warping it away would erase what makes the
+// shots different viewpoints.
 //
 // image's JPEG bytes come in the sensor's native (un-rotated) orientation -
 // the same convention resultPoints/matWidth/matHeight already use - so the
 // quad corners are mapped into that native pixel space with a pure scale,
-// no rotation. Only the final small crop gets rotated (by
-// imageInfo.rotationDegrees) into an upright, human-viewable orientation,
-// since rotating the multi-megapixel original first would be needless work.
-// This orientation assumption is exactly the kind that has broken this
-// project before (see md/status-2026-08-14-part2.md) - logged here so it's
-// verifiable against a real device rather than trusted blindly.
+// no rotation. Only the small crop gets rotated (by
+// imageInfo.rotationDegrees) into an upright, human-viewable orientation -
+// the raw full-size bytes are saved completely as-is, no manual rotation
+// applied, so they can't pick up a double-rotation bug if the camera's own
+// EXIF orientation tag already accounts for it. This orientation assumption
+// is exactly the kind that has broken this project before (see
+// md/status-2026-08-14-part2.md) - logged here so it's verifiable against a
+// real device rather than trusted blindly.
 private fun saveCapturedFrame(
     image: ImageProxy,
     matPoints: Array<Point>,
@@ -788,7 +793,8 @@ private fun saveCapturedFrame(
     val nativeCorners = matPoints.mapIndexed { i, _ -> Point(xs[i], ys[i]) }.toTypedArray()
 
     session.saveCapture(
-        finalBitmap = finalBitmap,
+        fullJpegBytes = bytes,
+        croppedBitmap = finalBitmap,
         signature = signature,
         nativeImageWidth = nativeBitmap.width,
         nativeImageHeight = nativeBitmap.height,
